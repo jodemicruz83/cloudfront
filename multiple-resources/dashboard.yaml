@@ -1,0 +1,1398 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Template that will create a Lambda Function to send CF Logs to CloudWatch. Template will create CW Contributor Insight rules, metric filters and a dashboard.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "S3 Logging Location"
+        Parameters:
+          - NotificationBucket
+          - CFLogPrefixParameter
+      -
+        Label:
+          default: "CloudFront Distribution"
+        Parameters:
+          - CFDistributionID
+      -
+        Label:
+          default: "Rule Configuration"
+        Parameters:
+          - ContributorInsightRuleState
+    ParameterLabels:
+      NotificationBucket:
+        default: "S3 Logging Bucket Name"
+      CFLogPrefixParameter:
+        default: "S3 Prefix for CloudFront Logs"
+      CFDistributionID:
+        default: "CloudFront Distribution ID"
+      ContributorInsightRuleState:
+        default: "Contributor Insight Rule State"
+Parameters:
+
+  # S3 Bucket where CF Logs are currently being written to. We need to enable S3 Event notifications on this bucket The bucket should be in the same region where we deploy this CFN template
+  NotificationBucket:
+    Type: String
+    Description: Name of the S3 bucket where we are storing our CloudFront Logs. S3 Bucket should be in the same region that this template is deployed in. ex. my-logging-bucket
+
+  # S3 Prefix where CF Logs are being written to, we will use this to enable S3 Event Notifications.
+  CFLogPrefixParameter:
+    Type: String
+    Description: >-
+      Select the S3 prefix where CloudFront Logs are being written. ex. logs/
+
+  CFDashboardName: #Alexandre Gomes, adiconado como parametro porque os loggroups ja existem na versao nova do terraform.
+    Type: String
+    Description: >-
+      Name of Dashboard. Ex. www.trtx.jus.br
+
+ # give the customer the option to set the Contributor Insight Rules to be disabled on creation
+  ContributorInsightRuleState:
+      Type: String
+      Description: Select to enable or disable the Contributor Insight Rules on Creation.
+      Default: ENABLED
+      AllowedValues:
+        - ENABLED
+        - DISABLED
+
+  # CloudFront DistributionID - we need this to pull in metrics for the dashboard optionally, we can use the distrobution ID when naming the CW Log Group
+  CFDistributionID:
+      Type: String
+      Description: >-
+        Select the CF DistributioID - this will be used to pull metrics for a CF Dashboard, naming of the Log Group, and Namespace for our Metric Filters - ex. EDFDVBD6EXAMPLE
+
+Resources:
+
+    # CW Log Group where we will write CF Logs
+    CloudWatchLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub cloudfront/${CFDistributionID}
+
+
+    # Lambda Function that will write CF Logs stored in S3, and send them to a defined CW Log Group
+    CFtoCWLogFunction:
+      Type: 'AWS::Lambda::Function'
+      Properties:
+        Code:
+          S3Bucket: mng-blog-solutions
+          S3Key: cloudfront-to-cloudwatch-blog/lambda_function.zip
+        Handler: lambda_function.lambda_handler
+        Role: !GetAtt LambdaIAMRoleCW.Arn
+        Runtime: python3.8
+        Timeout: 30
+        FunctionName: !Sub CF-to-CW-Log-Function-${CFDistributionID}
+        Environment:
+          Variables:
+            LOG_GROUP_NAME: !Ref CloudWatchLogGroup
+            #LogGroupName: cloudfront/!Ref CFDistributionID
+        Description: >-
+          Lambda Function which takes CF logs from S3, and writes them to a CW Log
+          group defined in env variables
+
+    # Lambda Trust Policy, which allows the customer defined S3 bucket to Invoke the CF to CW Logs function
+    LambdaInvokePermission:
+      Type: 'AWS::Lambda::Permission'
+      Properties:
+        FunctionName: !GetAtt CFtoCWLogFunction.Arn
+        Action: 'lambda:InvokeFunction'
+        Principal: s3.amazonaws.com
+        SourceAccount: !Ref 'AWS::AccountId'
+        SourceArn: !Sub 'arn:aws:s3:::${NotificationBucket}'
+
+    # IAM role for Custom Lambda Backed Resource that will update S3 Event NotificationBucket
+    LambdaIAMRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        Policies:
+          - PolicyName: root
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 's3:GetBucketNotification'
+                    - 's3:PutBucketNotification'
+                  Resource: !Sub 'arn:aws:s3:::${NotificationBucket}'
+                - Effect: Allow
+                  Action:
+                    - 'logs:CreateLogGroup'
+                    - 'logs:CreateLogStream'
+                    - 'logs:PutLogEvents'
+                  Resource: 'arn:aws:logs:*:*:*'
+                - Effect: Allow
+                  Action:
+                    - 's3:*'
+                  Resource: 'arn:aws:s3:::trt23-troubleshooting-logs'
+
+    # IAM Role for Lambda Function that will fetch CF logs from S3 and write them to CW Logs.
+    LambdaIAMRoleCW:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        Policies:
+          - PolicyName: root
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 's3:GetObject'
+                  Resource: !Sub 'arn:aws:s3:::${NotificationBucket}/${CFLogPrefixParameter}*'
+                - Effect: Allow
+                  Action:
+                    - 'logs:CreateLogGroup'
+                    - 'logs:CreateLogStream'
+                    - 'logs:PutLogEvents'
+                  Resource: 'arn:aws:logs:*:*:*'
+
+
+    # We are using a custom resource to add an Event notification to our S3 bucket
+    # https://aws.amazon.com/premiumsupport/knowledge-center/cloudformation-s3-notification-lambda/
+    CustomResourceLambdaFunction:
+      Type: 'AWS::Lambda::Function'
+      Properties:
+        Description: Lambda Function to modify the S3 event notification for an existing S3 bucket
+        Handler: index.lambda_handler
+        Role: !GetAtt LambdaIAMRole.Arn
+        Code:
+          ZipFile: |
+
+              from __future__ import print_function
+              import json
+              import boto3
+              import cfnresponse
+
+              SUCCESS = "SUCCESS"
+              FAILED = "FAILED"
+
+              print('Loading function')
+              s3 = boto3.resource('s3')
+
+              def lambda_handler(event, context):
+                  print("Received event: " + json.dumps(event, indent=2))
+                  responseData={}
+                  try:
+                      if event['RequestType'] == 'Delete':
+                          print("Request Type:",event['RequestType'])
+                          Bucket=event['ResourceProperties']['Bucket']
+                          Prefix=event['ResourceProperties']['Prefix']
+                          delete_notification(Bucket,Prefix)
+                          print("Sending response to custom resource after Delete")
+                      elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                          print("Request Type:",event['RequestType'])
+                          LambdaArn=event['ResourceProperties']['LambdaArn']
+                          Bucket=event['ResourceProperties']['Bucket']
+                          Prefix=event['ResourceProperties']['Prefix']
+                          add_notification(LambdaArn, Bucket, Prefix)
+                          responseData={'Bucket':Bucket}
+                          print("Sending response to custom resource")
+                      responseStatus = 'SUCCESS'
+                  except Exception as e:
+                      print('Failed to process:', e)
+                      responseStatus = 'SUCCESS' #temporario
+                      responseData = {'Failure': str(e)}
+
+                  cfnresponse.send(event, context, responseStatus, responseData)
+
+              def add_notification(LambdaArn, Bucket, Prefix):
+                bucket_notification = s3.BucketNotification(Bucket)
+                session = boto3.session.Session()
+                s3_client = session.client('s3')
+                result = s3_client.get_bucket_notification_configuration(Bucket=Bucket)
+                try:
+                    print("Configuracoes atuais do Bucket: \n %s" % result['LambdaFunctionConfigurations'])
+                    LambdaPutConfigs = result['LambdaFunctionConfigurations']
+                except Exception as e:
+                    print("Nao ha configuracoes novas, criando lista vazia")
+                    LambdaPutConfigs = []
+                nova_config =  {
+                        'Id' : Prefix,
+                        'LambdaFunctionArn': LambdaArn,
+                        'Events': [
+                            's3:ObjectCreated:*'
+                        ],
+                        'Filter': {
+                            'Key': {
+                            'FilterRules': [
+                                {
+                                'Name': 'prefix',
+                                'Value': Prefix
+                                },
+                            ]
+                            }
+                            }
+                    }
+                LambdaPutConfigs.append(
+                    nova_config
+                )
+                print("Config atualizada: \n %s" % LambdaPutConfigs)
+
+                response = s3_client.put_bucket_notification_configuration(
+                    Bucket = Bucket,
+                    NotificationConfiguration = {'LambdaFunctionConfigurations' : LambdaPutConfigs}
+                )
+
+                print("Put request completed....")
+
+              def delete_notification(Bucket,Prefix):
+                session = boto3.session.Session()
+                s3_client = session.client('s3')
+                result = s3_client.get_bucket_notification_configuration(Bucket=Bucket)
+                try:
+                    print("Configuracoes atuais do Bucket: \n %s" % result['LambdaFunctionConfigurations'])
+                    LambdaPutConfigs = result['LambdaFunctionConfigurations']
+                except Exception as e:
+                    print("Nao ha configuracoes novas, criando lista vazia")
+                    LambdaPutConfigs = []
+                index = 0
+                for config in LambdaPutConfigs:
+                    if Prefix in config['Filter']['Key']['FilterRules'][0]['Value']:
+                        print(config)
+                        del LambdaPutConfigs[index]
+                    index = index + 1
+                print('Lista atualizada: %s' % LambdaPutConfigs)
+                response = s3_client.put_bucket_notification_configuration(
+                    Bucket = Bucket,
+                    NotificationConfiguration = {'LambdaFunctionConfigurations' : LambdaPutConfigs}
+                )
+                print("Delete request completed....")
+        Runtime: python3.9
+        Timeout: 50
+
+    # # Custom Resource that will create the S3 event notification
+    LambdaTrigger:
+      Type: 'Custom::LambdaTrigger'
+      DependsOn: LambdaInvokePermission
+      Properties:
+        ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+        LambdaArn: !GetAtt CFtoCWLogFunction.Arn
+        Bucket: !Ref NotificationBucket
+        Prefix: !Ref CFLogPrefixParameter
+
+    # Metric Filters for HTTP Protocols
+    # CW Metric Filters for Log Group count HTTP requests
+    # also call out that we can organize by dimensions, so just a single CF namespace with each metric publishing the DistributionID as a dimension. not supported yet, but something to look into
+    HTTPMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type, x_edge_request_id, x_host_header, cs_protocol=http, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken # Can also be $sc_bytes if we want to measure data out. time taken will let us meausre latency of http vs https
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "HTTP-Requests"
+
+    # CW Metric Filters for Log Group to count HTTPs requests
+    # The Metric Value - Sample count will give us number of requests, while other stats will either give us the overall latency, or bytes out, depending on what metric value we define $time_taken or $sc_bytes
+    HTTPsMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type, x_edge_request_id, x_host_header, cs_protocol=https, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken # Can also be $sc_bytes if we want to measure data out. time taken will let us meausre latency of http vs https
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "HTTPS-Requests"
+
+
+    # Metric Filters for Origin and response latency -
+    # CW Metric for Time taken
+    TimeTakenMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "Time-Taken"
+
+    # CW Metric for Time to first byte or Origin Latency
+    TTFBMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_to_first_byte
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "Time-to-First-Byte"
+
+
+    # CW Metric Filter for Edge Response Status
+    # For these metrics we are collecting the x_edge_result_type field.
+    # How the server classified the response after the last byte left the server. In some cases, the result type can change between the time that the server is ready to send the response and the time that it finishes sending the response.
+    # For example, in HTTP streaming, suppose the server finds a segment of the stream in the cache. In that scenario, the value of this field would ordinarily be Hit. However, if the viewer closes the connection before the server has delivered the entire segment, the final result type (and the value of this field) is Error.
+    # Hit responses
+    HitRequestMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type=Hit, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "Hit-Requests"
+
+    # -	Refresh Hit  responses
+    RefreshHitRequestMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type=RefreshHit, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "RefreshHit-Requests"
+
+    # OriginShield Hit  responses
+    OriginShieldHitRequestMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type=OriginShieldHit, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "OriginShieldHit-Requests"
+
+
+    # -	Redirect  responses
+    RedirectRequestMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type=Redirect, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "Redirect-Requests"
+
+    # Miss Requests
+    MissRequestMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type=Miss, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "Miss-Requests"
+
+    # Error Requests
+    ErrorRequestMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type=Error, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "Error-Requests"
+
+
+    # LimitExceeded Requests
+    LimitExceededMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type=LimitExceeded, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "LimitExceeded-Requests"
+
+
+    # CapacityExceeded Requests
+    CapacityExceededMetricFilter:
+      Type: AWS::Logs::MetricFilter
+      Properties:
+        LogGroupName: !Ref CloudWatchLogGroup
+        FilterPattern: "[date, time, x_edge_location, sc_bytes, c_ip, cs_method, Host, cs_uri_stem, sc_status, cs_referer, cs_User_Agent, us_uri_query, Cookie, x_edge_result_type=CapacityExceeded, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end ]"
+        MetricTransformations:
+          -
+            MetricValue: $time_taken
+            MetricNamespace: !Ref CloudWatchLogGroup # need to ask for distribution ID in the parameters
+            MetricName: "CapacityExceeded-Requests"
+
+
+    # CloudWatch Insight Rules - CF-Bytes-Out-By-POP
+    BytesOutByPOPContributorInsightRule:
+      Type: AWS::CloudWatch::InsightRule
+      DependsOn: CloudWatchLogGroup
+      Properties:
+        RuleBody: !Sub |
+          {
+              "Schema": {
+                  "Name": "CloudWatchLogRule",
+                  "Version": 1
+              },
+              "AggregateOn": "Sum",
+              "Contribution": {
+                  "Filters": [],
+                  "Keys": [
+                      "Edge Location"
+                  ],
+                  "ValueOf": "Bytes Out"
+              },
+              "LogFormat": "CLF",
+              "LogGroupNames": [
+                  "${CloudWatchLogGroup}"
+              ],
+              "Fields": {
+                  "1": "Date",
+                  "2": "Time",
+                  "3": "Edge Location",
+                  "4": "Bytes Out",
+                  "5": "Viewer IP",
+                  "6": "HTTP Method",
+                  "7": "Host",
+                  "8": "URI Path",
+                  "9": "HTTP Status",
+                  "10": "Referer",
+                  "11": "User-Agent",
+                  "12": "Query String",
+                  "13": "Cookie",
+                  "14": "Edge Result Type",
+                  "15": "Edge Request ID",
+                  "16": "Host Header",
+                  "17": "Viewer Protocol",
+                  "18": "Bytes In",
+                  "19": "Time Taken",
+                  "20": "x-forwarded-for",
+                  "21": "SSL Protocol",
+                  "22": "SSL Cipher",
+                  "23": "Edge Response Result Type",
+                  "24": "Protocol Version",
+                  "25": "FLE  Status",
+                  "26": "FLW Encrypted Fields",
+                  "27": "Viewer Port",
+                  "28": "Time to First Byte",
+                  "29": "x-edge-detailed-result-type",
+                  "30": "Content Type",
+                  "31": "content Length",
+                  "32": "Start Range",
+                  "33": "End Range"
+              }
+          }
+        RuleName: !Sub CF-Bytes-Out-By-POP-${CFDistributionID}
+        RuleState: !Ref ContributorInsightRuleState
+
+    # CloudWatch Insight Rules - CF-Cache-Miss-by-URI
+    CacheMissByURIContributorInsightRule:
+      Type: AWS::CloudWatch::InsightRule
+      DependsOn: CloudWatchLogGroup
+      Properties:
+        RuleBody: !Sub |
+          {
+              "Schema": {
+                  "Name": "CloudWatchLogRule",
+                  "Version": 1
+              },
+              "AggregateOn": "Count",
+              "Contribution": {
+                  "Filters": [
+                      {
+                          "Match": "Edge Result Type",
+                          "In": [
+                              "Miss"
+                          ]
+                      },
+                      {
+                          "In": [
+                              "GET",
+                              "HEAD"
+                          ],
+                          "Match": "HTTP Method"
+                      }
+                  ],
+                  "Keys": [
+                      "URI Path"
+                  ],
+                  "ValueOf": "Bytes Out"
+              },
+              "LogFormat": "CLF",
+              "LogGroupNames": [
+                  "${CloudWatchLogGroup}"
+              ],
+              "Fields": {
+                  "1": "Date",
+                  "2": "Time",
+                  "3": "Edge Location",
+                  "4": "Bytes Out",
+                  "5": "Viewer IP",
+                  "6": "HTTP Method",
+                  "7": "Host",
+                  "8": "URI Path",
+                  "9": "HTTP Status",
+                  "10": "Referer",
+                  "11": "User-Agent",
+                  "12": "Query String",
+                  "13": "Cookie",
+                  "14": "Edge Result Type",
+                  "15": "Edge Request ID",
+                  "16": "Host Header",
+                  "17": "Viewer Protocol",
+                  "18": "Bytes In",
+                  "19": "Time Taken",
+                  "20": "x-forwarded-for",
+                  "21": "SSL Protocol",
+                  "22": "SSL Cipher",
+                  "23": "Edge Response Result Type",
+                  "24": "Protocol Version",
+                  "25": "FLE  Status",
+                  "26": "FLW Encrypted Fields",
+                  "27": "Viewer Port",
+                  "28": "Time to First Byte",
+                  "29": "x-edge-detailed-result-type",
+                  "30": "Content Type",
+                  "31": "content Length",
+                  "32": "Start Range",
+                  "33": "End Range"
+              }
+          }
+        RuleName: !Sub CF-Cache-Miss-by-URI-${CFDistributionID}
+        RuleState: !Ref ContributorInsightRuleState
+
+    # CloudWatch Insight Rules - CF-Edge-Status-by-POP
+    EdgeStatusByPOPContributorInsightRule:
+      Type: AWS::CloudWatch::InsightRule
+      DependsOn: CloudWatchLogGroup
+      Properties:
+        RuleBody: !Sub |
+          {
+              "Schema": {
+                  "Name": "CloudWatchLogRule",
+                  "Version": 1
+              },
+              "AggregateOn": "Count",
+              "Contribution": {
+                  "Filters": [],
+                  "Keys": [
+                      "x-edge-detailed-result-type",
+                      "Edge Location"
+                  ],
+                  "ValueOf": "Bytes Out"
+              },
+              "LogFormat": "CLF",
+              "LogGroupNames": [
+                  "${CloudWatchLogGroup}"
+              ],
+              "Fields": {
+                  "1": "Date",
+                  "2": "Time",
+                  "3": "Edge Location",
+                  "4": "Bytes Out",
+                  "5": "Viewer IP",
+                  "6": "HTTP Method",
+                  "7": "Host",
+                  "8": "URI Path",
+                  "9": "HTTP Status",
+                  "10": "Referer",
+                  "11": "User-Agent",
+                  "12": "Query String",
+                  "13": "Cookie",
+                  "14": "Edge Result Type",
+                  "15": "Edge Request ID",
+                  "16": "Host Header",
+                  "17": "Viewer Protocol",
+                  "18": "Bytes In",
+                  "19": "Time Taken",
+                  "20": "x-forwarded-for",
+                  "21": "SSL Protocol",
+                  "22": "SSL Cipher",
+                  "23": "Edge Response Result Type",
+                  "24": "Protocol Version",
+                  "25": "FLE  Status",
+                  "26": "FLW Encrypted Fields",
+                  "27": "Viewer Port",
+                  "28": "Time to First Byte",
+                  "29": "x-edge-detailed-result-type",
+                  "30": "Content Type",
+                  "31": "content Length",
+                  "32": "Start Range",
+                  "33": "End Range"
+              }
+          }
+        RuleName: !Sub CF-Edge-Status-by-POP-${CFDistributionID}
+        RuleState: !Ref ContributorInsightRuleState
+
+
+    # CloudWatch Insight Rules - CF-Errors-By-POP-and-Path
+    ErrorsByPOPAndPathContributorInsightRule:
+      Type: AWS::CloudWatch::InsightRule
+      DependsOn: CloudWatchLogGroup
+      Properties:
+        RuleBody: !Sub |
+          {
+              "Schema": {
+                  "Name": "CloudWatchLogRule",
+                  "Version": 1
+              },
+              "AggregateOn": "Count",
+              "Contribution": {
+                  "Filters": [
+                      {
+                          "Match": "HTTP Status",
+                          "StartsWith": [
+                              "5",
+                              "4"
+                          ]
+                      },
+                      {
+                          "Match": "Edge Result Type",
+                          "StartsWith": [
+                              "Error",
+                              "LimitExceeded",
+                              "CapacityExceeded"
+                          ]
+                      }
+                  ],
+                  "Keys": [
+                      "Edge Location",
+                      "URI Path"
+                  ],
+                  "ValueOf": "Bytes Out"
+              },
+              "LogFormat": "CLF",
+              "LogGroupNames": [
+                  "${CloudWatchLogGroup}"
+              ],
+              "Fields": {
+                  "1": "Date",
+                  "2": "Time",
+                  "3": "Edge Location",
+                  "4": "Bytes Out",
+                  "5": "Viewer IP",
+                  "6": "HTTP Method",
+                  "7": "Host",
+                  "8": "URI Path",
+                  "9": "HTTP Status",
+                  "10": "Referer",
+                  "11": "User-Agent",
+                  "12": "Query String",
+                  "13": "Cookie",
+                  "14": "Edge Result Type",
+                  "15": "Edge Request ID",
+                  "16": "Host Header",
+                  "17": "Viewer Protocol",
+                  "18": "Bytes In",
+                  "19": "Time Taken",
+                  "20": "x-forwarded-for",
+                  "21": "SSL Protocol",
+                  "22": "SSL Cipher",
+                  "23": "Edge Response Result Type",
+                  "24": "Protocol Version",
+                  "25": "FLE  Status",
+                  "26": "FLW Encrypted Fields",
+                  "27": "Viewer Port",
+                  "28": "Time to First Byte",
+                  "29": "x-edge-detailed-result-type",
+                  "30": "Content Type",
+                  "31": "content Length",
+                  "32": "Start Range",
+                  "33": "End Range"
+              }
+          }
+        RuleName: !Sub CF-Errors-By-POP-and-Path-${CFDistributionID}
+        RuleState: !Ref ContributorInsightRuleState
+
+    # CloudWatch Insight Rules - CF-Requests-by-HTTP-Method
+    # Note - It is possible to gather this datpoint by using Log Metric Filters.
+    CFRequestsByHTTPMethodContributorInsightRule:
+      Type: AWS::CloudWatch::InsightRule
+      DependsOn: CloudWatchLogGroup
+      Properties:
+        RuleBody: !Sub |
+          {
+              "Schema": {
+                  "Name": "CloudWatchLogRule",
+                  "Version": 1
+              },
+              "AggregateOn": "Count",
+              "Contribution": {
+                  "Filters": [],
+                  "Keys": [
+                      "HTTP Method"
+                  ],
+                  "ValueOf": "Bytes Out"
+              },
+              "LogFormat": "CLF",
+              "LogGroupNames": [
+                  "${CloudWatchLogGroup}"
+              ],
+              "Fields": {
+                  "1": "Date",
+                  "2": "Time",
+                  "3": "Edge Location",
+                  "4": "Bytes Out",
+                  "5": "Viewer IP",
+                  "6": "HTTP Method",
+                  "7": "Host",
+                  "8": "URI Path",
+                  "9": "HTTP Status",
+                  "10": "Referer",
+                  "11": "User-Agent",
+                  "12": "Query String",
+                  "13": "Cookie",
+                  "14": "Edge Result Type",
+                  "15": "Edge Request ID",
+                  "16": "Host Header",
+                  "17": "Viewer Protocol",
+                  "18": "Bytes In",
+                  "19": "Time Taken",
+                  "20": "x-forwarded-for",
+                  "21": "SSL Protocol",
+                  "22": "SSL Cipher",
+                  "23": "Edge Response Result Type",
+                  "24": "Protocol Version",
+                  "25": "FLE  Status",
+                  "26": "FLW Encrypted Fields",
+                  "27": "Viewer Port",
+                  "28": "Time to First Byte",
+                  "29": "x-edge-detailed-result-type",
+                  "30": "Content Type",
+                  "31": "content Length",
+                  "32": "Start Range",
+                  "33": "End Range"
+              }
+          }
+        RuleName: !Sub CF-Requests-by-HTTP-Method-${CFDistributionID}
+        RuleState: !Ref ContributorInsightRuleState
+
+    # CloudWatch Insight Rules - CF-Requests-by-URI
+    CFRequestsByURIContributorInsightRule:
+      Type: AWS::CloudWatch::InsightRule
+      DependsOn: CloudWatchLogGroup
+      Properties:
+        RuleBody: !Sub |
+          {
+              "Schema": {
+                  "Name": "CloudWatchLogRule",
+                  "Version": 1
+              },
+              "AggregateOn": "Count",
+              "Contribution": {
+                  "Filters": [],
+                  "Keys": [
+                      "URI Path"
+                  ],
+                  "ValueOf": "Bytes Out"
+              },
+              "LogFormat": "CLF",
+              "LogGroupNames": [
+                  "${CloudWatchLogGroup}"
+              ],
+              "Fields": {
+                  "1": "Date",
+                  "2": "Time",
+                  "3": "Edge Location",
+                  "4": "Bytes Out",
+                  "5": "Viewer IP",
+                  "6": "HTTP Method",
+                  "7": "Host",
+                  "8": "URI Path",
+                  "9": "HTTP Status",
+                  "10": "Referer",
+                  "11": "User-Agent",
+                  "12": "Query String",
+                  "13": "Cookie",
+                  "14": "Edge Result Type",
+                  "15": "Edge Request ID",
+                  "16": "Host Header",
+                  "17": "Viewer Protocol",
+                  "18": "Bytes In",
+                  "19": "Time Taken",
+                  "20": "x-forwarded-for",
+                  "21": "SSL Protocol",
+                  "22": "SSL Cipher",
+                  "23": "Edge Response Result Type",
+                  "24": "Protocol Version",
+                  "25": "FLE  Status",
+                  "26": "FLW Encrypted Fields",
+                  "27": "Viewer Port",
+                  "28": "Time to First Byte",
+                  "29": "x-edge-detailed-result-type",
+                  "30": "Content Type",
+                  "31": "content Length",
+                  "32": "Start Range",
+                  "33": "End Range"
+              }
+          }
+        RuleName: !Sub CF-Requests-by-URI-${CFDistributionID}
+        RuleState: !Ref ContributorInsightRuleState
+
+    # CloudWatch Insight Rules - CF-Requests-by-URI-and-UserAgent
+    CFRequestsByURIAndUserAgentContributorInsightRule:
+      Type: AWS::CloudWatch::InsightRule
+      DependsOn: CloudWatchLogGroup
+      Properties:
+        RuleBody: !Sub |
+          {
+              "Schema": {
+                  "Name": "CloudWatchLogRule",
+                  "Version": 1
+              },
+              "AggregateOn": "Count",
+              "Contribution": {
+                  "Filters": [],
+                  "Keys": [
+                      "URI Path",
+                      "User-Agent"
+                  ],
+                  "ValueOf": "Bytes Out"
+              },
+              "LogFormat": "CLF",
+              "LogGroupNames": [
+                  "${CloudWatchLogGroup}"
+              ],
+              "Fields": {
+                  "1": "Date",
+                  "2": "Time",
+                  "3": "Edge Location",
+                  "4": "Bytes Out",
+                  "5": "Viewer IP",
+                  "6": "HTTP Method",
+                  "7": "Host",
+                  "8": "URI Path",
+                  "9": "HTTP Status",
+                  "10": "Referer",
+                  "11": "User-Agent",
+                  "12": "Query String",
+                  "13": "Cookie",
+                  "14": "Edge Result Type",
+                  "15": "Edge Request ID",
+                  "16": "Host Header",
+                  "17": "Viewer Protocol",
+                  "18": "Bytes In",
+                  "19": "Time Taken",
+                  "20": "x-forwarded-for",
+                  "21": "SSL Protocol",
+                  "22": "SSL Cipher",
+                  "23": "Edge Response Result Type",
+                  "24": "Protocol Version",
+                  "25": "FLE  Status",
+                  "26": "FLW Encrypted Fields",
+                  "27": "Viewer Port",
+                  "28": "Time to First Byte",
+                  "29": "x-edge-detailed-result-type",
+                  "30": "Content Type",
+                  "31": "content Length",
+                  "32": "Start Range",
+                  "33": "End Range"
+              }
+          }
+        RuleName: !Sub CF-Requests-by-URI-and-UserAgent-${CFDistributionID}
+        RuleState: !Ref ContributorInsightRuleState
+
+
+    # CloudWatch Insight Rules - CF-Status-by-POP
+    CFStatusByPOPContributorInsightRule:
+      Type: AWS::CloudWatch::InsightRule
+      DependsOn: CloudWatchLogGroup
+      Properties:
+        RuleBody: !Sub |
+          {
+              "Schema": {
+                  "Name": "CloudWatchLogRule",
+                  "Version": 1
+              },
+              "AggregateOn": "Count",
+              "Contribution": {
+                  "Filters": [],
+                  "Keys": [
+                      "HTTP Status",
+                      "Edge Location"
+                  ],
+                  "ValueOf": "Bytes Out"
+              },
+              "LogFormat": "CLF",
+              "LogGroupNames": [
+                  "${CloudWatchLogGroup}"
+              ],
+              "Fields": {
+                  "1": "Date",
+                  "2": "Time",
+                  "3": "Edge Location",
+                  "4": "Bytes Out",
+                  "5": "Viewer IP",
+                  "6": "HTTP Method",
+                  "7": "Host",
+                  "8": "URI Path",
+                  "9": "HTTP Status",
+                  "10": "Referer",
+                  "11": "User-Agent",
+                  "12": "Query String",
+                  "13": "Cookie",
+                  "14": "Edge Result Type",
+                  "15": "Edge Request ID",
+                  "16": "Host Header",
+                  "17": "Viewer Protocol",
+                  "18": "Bytes In",
+                  "19": "Time Taken",
+                  "20": "x-forwarded-for",
+                  "21": "SSL Protocol",
+                  "22": "SSL Cipher",
+                  "23": "Edge Response Result Type",
+                  "24": "Protocol Version",
+                  "25": "FLE  Status",
+                  "26": "FLW Encrypted Fields",
+                  "27": "Viewer Port",
+                  "28": "Time to First Byte",
+                  "29": "x-edge-detailed-result-type",
+                  "30": "Content Type",
+                  "31": "content Length",
+                  "32": "Start Range",
+                  "33": "End Range"
+              }
+          }
+        RuleName: !Sub CF-Status-by-POP-${CFDistributionID}
+        RuleState: !Ref ContributorInsightRuleState
+
+    # CloudWatch Dashboard -
+    # display wigets containing reports from Insight Rules, Metrics, and Metric Filters
+    CWDashboardForCFLogs:
+      Type: AWS::CloudWatch::Dashboard
+      DependsOn:
+        - CloudWatchLogGroup
+        - CFStatusByPOPContributorInsightRule
+        - CFRequestsByURIAndUserAgentContributorInsightRule
+        - CFRequestsByURIContributorInsightRule
+        - CFRequestsByHTTPMethodContributorInsightRule
+        - ErrorsByPOPAndPathContributorInsightRule
+        - EdgeStatusByPOPContributorInsightRule
+        - CacheMissByURIContributorInsightRule
+        - BytesOutByPOPContributorInsightRule
+      Properties:
+
+        DashboardBody: !Sub |
+          {
+              "widgets": [
+                  {
+                      "type": "metric",
+                      "x": 0,
+                      "y": 12,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${BytesOutByPOPContributorInsightRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                            "region": "${AWS::Region}",
+                          "title": "Bytes Out By POP",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 12,
+                      "y": 6,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${CFRequestsByHTTPMethodContributorInsightRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Requests By HTTP Method",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 0,
+                      "y": 18,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${CFRequestsByURIContributorInsightRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Requests By URI",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 12,
+                      "y": 12,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${CacheMissByURIContributorInsightRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Cache Miss By URI",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 12,
+                      "y": 24,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${ErrorsByPOPAndPathContributorInsightRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Errors By POP and Path",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 12,
+                      "y": 18,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${CFStatusByPOPContributorInsightRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "HTTP Status By POP",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 0,
+                      "y": 24,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${EdgeStatusByPOPContributorInsightRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Edge Status By POP",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 12,
+                      "y": 30,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "period": 60,
+                          "insightRule": {
+                              "maxContributorCount": 10,
+                              "orderBy": "Sum",
+                              "ruleName": "${CFRequestsByURIAndUserAgentContributorInsightRule.RuleName}"
+                          },
+                          "stacked": false,
+                          "view": "timeSeries",
+                          "yAxis": {
+                              "left": {
+                                  "showUnits": false
+                              },
+                              "right": {
+                                  "showUnits": false
+                              }
+                          },
+                          "region": "${AWS::Region}",
+                          "title": "Requests By URI and UserAgent",
+                          "legend": {
+                              "position": "right"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 0,
+                      "y": 6,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "${CloudWatchLogGroup}", "Miss-Requests", { "id": "m2" } ],
+                              [ ".", "Hit-Requests", { "id": "m3" } ],
+                              [ ".", "LimitExceeded-Requests", { "id": "m4" } ],
+                              [ ".", "Error-Requests", { "id": "m5" } ],
+                              [ ".", "CapacityExceeded-Requests", { "id": "m6" } ],
+                              [ ".", "OriginShieldHit-Requests", { "id": "m7" } ],
+                              [ ".", "Redirect-Requests", { "id": "m8" } ],
+                              [ ".", "RefreshHit-Requests", { "id": "m9" } ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "stat": "SampleCount",
+                          "period": 60,
+                          "title": "Edge Status",
+                          "legend": {
+                              "position": "bottom"
+                          }
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 6,
+                      "y": 0,
+                      "width": 6,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "AWS/CloudFront", "Requests", "Region", "Global", "DistributionId", "${CFDistributionID}", { "region": "us-east-1" } ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "period": 60,
+                          "stat": "Sum"
+                      }
+                  },
+                  {
+                      "type": "text",
+                      "x": 0,
+                      "y": 0,
+                      "width": 6,
+                      "height": 6,
+                      "properties": {
+                          "markdown": "\n# CloudFront Insights Dashboard\n Distribution URL \n\nSample Dashboard showing some of the different visualization options for CloudFront.\n\n\n## Metric Filters\nThis Dashboard shows Metrics that were created from a metric filter in CloudWatch Logs. In the metric filter, we defined each edge status type as a metric. the metric value is in the overall time taken, but the sample count will tell us the number of requests for a given result type. \n\n## Contributor Insights \nContributor Insights rules are used to power many of the visualizations on this Dashboard. we can get requests by URI, Edge Location. See error type by Edge Location. We can see the most popular objects for a given status, etc. \n"
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 12,
+                      "y": 0,
+                      "width": 6,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "AWS/CloudFront", "4xxErrorRate", "Region", "Global", "DistributionId", "${CFDistributionID}", { "region": "us-east-1", "color": "#ff7f0e" } ],
+                              [ ".", "5xxErrorRate", ".", ".", ".", ".", { "region": "us-east-1", "color": "#d62728" } ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "annotations": {
+                              "horizontal": [
+                                  {
+                                      "label": "Page Someone",
+                                      "value": 0.8
+                                  }
+                              ]
+                          },
+                          "period": 300,
+                          "stat": "Average"
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 18,
+                      "y": 0,
+                      "width": 6,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "AWS/CloudFront", "BytesDownloaded", "Region", "Global", "DistributionId", "${CFDistributionID}", { "region": "us-east-1", "color": "#2ca02c" } ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "stat": "Sum",
+                          "period": 60
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 0,
+                      "y": 30,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "${CloudWatchLogGroup}", "HTTP-Requests" ],
+                              [ ".", "HTTPS-Requests" ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "title": "HTTP vs HTTPs",
+                          "period": 60,
+                          "stat": "SampleCount"
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 0,
+                      "y": 36,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "${CloudWatchLogGroup}", "Time-Taken" ],
+                              [ ".", "Time-to-First-Byte" ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "${AWS::Region}",
+                          "stat": "p99",
+                          "period": 60,
+                          "title": "P99 Time vs TTFB Seconds"
+                      }
+                  },
+                  {
+                    "type": "log",
+                    "x": 0,
+                    "y": 42,
+                    "width": 24,
+                    "height": 6,
+                    "properties": {
+                        "query": "SOURCE '${CloudWatchLogGroup}' | parse @message \"*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\t*\" as date, time, x_edge_location, sc_bytes, c_ip, cs_method, host, cs_uri_stem, sc_status, referer, useragent, cs_uri_query, cookie, x_edge_result_type, x_edge_request_id, x_host_header, cs_protocol, cs_bytes, time_taken, x_forwarded_for, ssl_protocol, ssl_cipher, x_edge_response_result_type, cs_protocol_version, fle_status, fle_encrypted_fields, c_port, time_to_first_byte, x_edge_detailed_result_type, sc_content_type, sc_content_len, sc_range_start, sc_range_end\n| limit 20\n| sort @timestamp desc ",
+                        "region": "${AWS::Region}",
+                        "stacked": false,
+                        "view": "table"
+                    }
+                }
+              ]
+           }
+        DashboardName: !Sub  ${CFDashboardName}-Monitoring
+Outputs:
+  OutputDashboardURI:
+    Description: Link to the CloudWatch Dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CWDashboardForCFLogs}'

@@ -1,0 +1,5 @@
+aws cloudformation create-stack --template-url https://cf-templates-91al6d17hhy1-us-east-1.s3.amazonaws.com/template.yaml \ 
+--capabilities CAPABILITY_NAMED_IAM --parameters ParameterKey=CFDistributionID,ParameterValue=E3V5ZVJGY7WKNF \ 
+ParameterKey=CFLogPrefixParameter,ParameterValue=moodle-hml.trt23.jus.br ParameterKey=ContributorInsightRuleState,ParameterValue=ENABLED \ 
+ParameterKey=NotificationBucket,ParameterValue=cloudfront-logging-trt23 ParameterKey=CFDashboardName,ParameterValue=moodle-hml \ 
+--stack-name dashboard-moodle-hml --region us-east-1 --disable-rollback

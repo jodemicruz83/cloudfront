@@ -1,0 +1,10 @@
+resource "null_resource" "deploy_cdn_dashboard" {
+  triggers = {
+    build = timestamp()
+  }
+
+  provisioner "local-exec" {
+    working_dir = path.module
+    command     = "sls deploy --region ${var.region} --aws-profile ${var.aws_profile}"
+  }
+}
