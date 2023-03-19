@@ -9,7 +9,7 @@ terraform {
 
 provider "aws" {
   region  = us-east-1
-  profile = "TRT7"
+  profile = "default"
 
   # default_tags {
   #   tags = {

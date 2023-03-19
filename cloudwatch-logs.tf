@@ -129,7 +129,7 @@ resource "aws_cloudwatch_query_definition" "Block_por_Host" {
 
   query_string = <<EOF
 parse @message /\{"name":"[Hh]ost\",\"value":\"(?<Host>[^"}]*)/
-| filter Host = "www.trt4.jus.br"
+| filter Host = "www.codeteste.com"
 | filter action = "BLOCK"
 | fields terminatingRuleId as Rule, action, httpRequest.country as Country, httpRequest.clientIp as ClientIP, httpRequest.uri as URI
 EOF
